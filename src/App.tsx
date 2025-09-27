@@ -37,6 +37,11 @@ function Editor() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<WorkflowEdge['data']>([])
   const { project, getViewport } = useReactFlow()
 
+  // Undo/Redo state management
+  const [history, setHistory] = useState<Array<{ nodes: WorkflowNode[]; edges: WorkflowEdge[] }>>([])
+  const [historyIndex, setHistoryIndex] = useState(-1)
+  const [isUndoRedo, setIsUndoRedo] = useState(false)
+
   // Theme state
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const stored = localStorage.getItem('theme') as 'light' | 'dark' | null
@@ -59,13 +64,7 @@ function Editor() {
       if (raw) {
         const parsed = JSON.parse(raw) as { nodes: PersistedNode[]; edges: PersistedEdge[] }
         const { nodes: nn, edges: ee } = deserialize(parsed)
-        // Validate any stored image URLs (fire & forget)
-        ensureValidImageUrls(nn as any).then(res => {
-          if (res.replaced.length) {
-            console.info('Replaced invalid image URLs on restore:', res.replaced)
-          }
-          setNodes(res.nodes as any)
-        }).catch(()=> setNodes(nn as any))
+        setNodes(nn as any)
         setEdges(ee)
       }
     } catch (e) {
@@ -87,6 +86,26 @@ function Editor() {
       }
     })
   }, [nodes, edges])
+
+  // Track history for undo/redo (skip during undo/redo operations)
+  useEffect(() => {
+    if (isUndoRedo) return
+    if (nodes.length === 0 && edges.length === 0) return // Skip empty initial state
+    
+    const newState = { nodes: nodes as WorkflowNode[], edges: edges as WorkflowEdge[] }
+    setHistory(prev => {
+      // Remove any future history if we're in the middle
+      const newHistory = prev.slice(0, historyIndex + 1)
+      newHistory.push(newState)
+      // Keep last 50 states
+      return newHistory.slice(-50)
+    })
+    setHistoryIndex(prev => {
+      const newHistory = history.slice(0, prev + 1)
+      newHistory.push(newState)
+      return Math.min(newHistory.length - 1, 49)
+    })
+  }, [nodes, edges, isUndoRedo, historyIndex, history])
 
   const clearWorkflow = useCallback(() => {
     if (!window.confirm('Clear current workflow? This cannot be undone.')) return
@@ -119,13 +138,7 @@ function Editor() {
   const [cropping, setCropping] = useState(false)
   const [cropRect, setCropRect] = useState<{ x: number; y: number; width: number; height: number } | null>(null)
   const cropStartRef = useRef<{ x: number; y: number } | null>(null)
-  // Validation toast state
-  const [validationReport, setValidationReport] = useState<Array<{ id: string; from?: string; to: string }>>([])
-  useEffect(() => {
-    if (validationReport.length === 0) return
-    const t = setTimeout(() => setValidationReport([]), 6000)
-    return () => clearTimeout(t)
-  }, [validationReport])
+
 
   const onConnect: OnConnect = useCallback(
     (params) =>
@@ -217,10 +230,13 @@ function Editor() {
       const b = wrapper.getBoundingClientRect()
       return project({ x: b.width / 2, y: b.height / 2 })
     })()
-    const url = window.prompt('Enter image URL (or Cancel to upload a file):')?.trim()
-    if (url && looksLikeImageUrl(url)) {
-      addNodeAt('circle', center, { data: { shape: 'circle', label: 'Image', imageUrl: url } })
-      return
+    const rawUrl = window.prompt('Enter image URL (or Cancel to upload a file):')?.trim()
+    if (rawUrl) {
+      const cleanedUrl = cleanUrl(rawUrl)
+      if (looksLikeImageUrl(cleanedUrl)) {
+        addNodeAt('circle', center, { data: { shape: 'circle', label: 'Image', imageUrl: cleanedUrl } })
+        return
+      }
     }
     // trigger file upload
     fileInputRef.current?.click()
@@ -269,9 +285,12 @@ function Editor() {
           reader.readAsDataURL(file)
         }
       } else {
-        const url = evt.dataTransfer?.getData('text/uri-list') || evt.dataTransfer?.getData('text/plain')
-        if (url && looksLikeImageUrl(url)) {
-          addNodeAt('circle', flowPos, { data: { shape: 'circle', label: 'Image', imageUrl: url } })
+        const rawUrl = evt.dataTransfer?.getData('text/uri-list') || evt.dataTransfer?.getData('text/plain')
+        if (rawUrl) {
+          const cleanedUrl = cleanUrl(rawUrl)
+          if (looksLikeImageUrl(cleanedUrl)) {
+            addNodeAt('circle', flowPos, { data: { shape: 'circle', label: 'Image', imageUrl: cleanedUrl } })
+          }
         }
       }
     },
@@ -297,10 +316,16 @@ function Editor() {
   // Paste handler for image URLs
   useEffect(() => {
     const onPaste = (evt: ClipboardEvent) => {
-      const text = evt.clipboardData?.getData('text/plain')?.trim()
-      if (text && looksLikeImageUrl(text)) {
-        addNodeAt('circle', lastMouseFlowPos, { data: { shape: 'circle', label: 'Pasted Image', imageUrl: text } })
-      } else if (evt.clipboardData) {
+      const rawText = evt.clipboardData?.getData('text/plain')?.trim()
+      if (rawText) {
+        const cleanedUrl = cleanUrl(rawText)
+        if (looksLikeImageUrl(cleanedUrl)) {
+          addNodeAt('circle', lastMouseFlowPos, { data: { shape: 'circle', label: 'Pasted Image', imageUrl: cleanedUrl } })
+          return
+        }
+      }
+      
+      if (evt.clipboardData) {
         const items = evt.clipboardData.items
         for (let i = 0; i < items.length; i++) {
           const it = items[i]
@@ -321,19 +346,41 @@ function Editor() {
     return () => window.removeEventListener('paste', onPaste)
   }, [addNodeAt, lastMouseFlowPos])
 
-  // Delete via keyboard
+  // Undo/Redo functions
+  const undo = useCallback(() => {
+    if (historyIndex > 0) {
+      setIsUndoRedo(true)
+      const prevState = history[historyIndex - 1]
+      setNodes(prevState.nodes as any)
+      setEdges(prevState.edges as any)
+      setHistoryIndex(historyIndex - 1)
+      setTimeout(() => setIsUndoRedo(false), 0)
+    }
+  }, [history, historyIndex, setNodes, setEdges])
+
+  const redo = useCallback(() => {
+    if (historyIndex < history.length - 1) {
+      setIsUndoRedo(true)
+      const nextState = history[historyIndex + 1]
+      setNodes(nextState.nodes as any)
+      setEdges(nextState.edges as any)
+      setHistoryIndex(historyIndex + 1)
+      setTimeout(() => setIsUndoRedo(false), 0)
+    }
+  }, [history, historyIndex, setNodes, setEdges])
+
+  // Delete via keyboard + undo/redo shortcuts
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const ae = document.activeElement as HTMLElement | null
+      const inInput = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)
+      
       if (e.key === 'Delete' || e.key === 'Backspace') {
-        const ae = document.activeElement as HTMLElement | null
-        if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) {
-          return
-        }
+        if (inInput) return
         setNodes((nds) => nds.filter((n) => !n.selected))
         setEdges((eds) => eds.filter((e) => !e.selected))
       } else if (e.key.toLowerCase() === 'r') {
-        const ae = document.activeElement as HTMLElement | null
-        if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return
+        if (inInput) return
         // rotate all selected nodes by +90
         setNodes((nds) => nds.map((n) => {
           if (!n.selected) return n
@@ -343,11 +390,17 @@ function Editor() {
         }))
         // Clone edges (path recalculation) after next frame to ensure DOM updated
         requestAnimationFrame(() => setEdges(eds => eds.map(e => ({ ...e }))))
+      } else if (e.ctrlKey && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault()
+        undo()
+      } else if (e.ctrlKey && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) {
+        e.preventDefault()
+        redo()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [setEdges, setNodes])
+  }, [setEdges, setNodes, undo, redo])
 
   const downloadJSON = useCallback(() => {
     const payload = serialize(nodes as WorkflowNode[], edges)
@@ -364,12 +417,7 @@ function Editor() {
         try {
           const parsed = JSON.parse(String(reader.result)) as { nodes: PersistedNode[]; edges: PersistedEdge[] }
           const { nodes: nn, edges: ee } = deserialize(parsed)
-          ensureValidImageUrls(nn as any).then(res => {
-            if (res.replaced.length) {
-              setValidationReport(res.replaced)
-            }
-            setNodes(res.nodes as any)
-          }).catch(()=> setNodes(nn as any))
+          setNodes(nn as any)
           setEdges(ee)
         } catch (err) {
           alert('Invalid workflow JSON')
@@ -611,17 +659,9 @@ function Editor() {
                   throw new Error('Missing nodes/edges array')
                 }
                 const { nodes: nn, edges: ee } = deserialize(parsed)
-                ensureValidImageUrls(nn as any).then(res => {
-                  if (res.replaced.length) setValidationReport(res.replaced)
-                  setNodes(res.nodes as any)
-                  setEdges(ee)
-                  setPasteModal({ open: false, text: '' })
-                }).catch(err => {
-                  console.warn('Validation failed', err)
-                  setNodes(nn as any)
-                  setEdges(ee)
-                  setPasteModal({ open: false, text: '' })
-                })
+                setNodes(nn as any)
+                setEdges(ee)
+                setPasteModal({ open: false, text: '' })
               } catch (err: any) {
                 setPasteModal((pm) => ({ ...pm, error: err?.message || 'Invalid JSON' }))
               }
@@ -674,19 +714,7 @@ function Editor() {
             </div>
           </div>
         )}
-        {validationReport.length > 0 && (
-          <div className="validation-toast" onClick={() => setValidationReport([])} title="Click to dismiss">
-            <strong>Icon fixes:</strong>
-            <ul>
-              {validationReport.slice(0,6).map(r => (
-                <li key={r.id}>
-                  {r.id}: {r.from ? (r.to === '(removed)' ? 'removed invalid image' : 'replaced') : 'added'}
-                </li>
-              ))}
-              {validationReport.length > 6 && <li>… {validationReport.length - 6} more</li>}
-            </ul>
-          </div>
-        )}
+
       </div>
     </div>
   )
@@ -730,7 +758,17 @@ function serialize(nodes: WorkflowNode[], edges: WorkflowEdge[]): { nodes: Persi
 }
 
 function deserialize(payload: { nodes: PersistedNode[]; edges: PersistedEdge[] }): { nodes: WorkflowNode[]; edges: WorkflowEdge[] } {
-  const nn: WorkflowNode[] = payload.nodes.map((n) => ({ id: n.id, type: 'n8nNode', position: n.position, data: { shape: n.shape, label: n.data?.label, imageUrl: n.data?.imageUrl, orientation: n.data?.orientation ?? 0 } }))
+  const nn: WorkflowNode[] = payload.nodes.map((n) => ({ 
+    id: n.id, 
+    type: 'n8nNode', 
+    position: n.position, 
+    data: { 
+      shape: n.shape, 
+      label: n.data?.label, 
+      imageUrl: cleanUrl(n.data?.imageUrl || ''), 
+      orientation: n.data?.orientation ?? 0 
+    } 
+  }))
   const ee: WorkflowEdge[] = payload.edges.map((e) => styleEdge({ id: e.id, source: e.source, target: e.target, data: e.data as any } as any))
   // Reset id counter to avoid collisions
   const maxId = nn.reduce((m, n) => Math.max(m, parseInt(n.id.split('_')[1] || '0', 10) || 0), 0)
@@ -825,30 +863,8 @@ function buildImageUrl(term: string): string {
 }
 
 async function ensureValidImageUrls(nodes: WorkflowNode[]): Promise<{ nodes: WorkflowNode[]; replaced: Array<{ id: string; from?: string; to: string }> }> {
-  const replacements: Array<{ id: string; from?: string; to: string }> = []
-  const validated = await Promise.all(nodes.map(async (n) => {
-    const data: any = n.data || {}
-    const current = data.imageUrl
-    let ok = false
-    if (current) {
-      ok = await validateImageUrl(current)
-    }
-    if (ok) return n
-    // Build fallback
-  const term = guessSearchTerm(data.label || data.shape)
-  const url = buildImageUrl(term)
-  const fallbackOk = await validateImageUrl(url)
-    if (fallbackOk) {
-      replacements.push({ id: n.id, from: current, to: url })
-      return { ...n, data: { ...data, imageUrl: url } }
-    } else {
-      // As last resort remove invalid imageUrl so inline icon shows
-      if (current) replacements.push({ id: n.id, from: current, to: '(removed)' })
-      const { imageUrl, ...rest } = data
-      return { ...n, data: { ...rest } }
-    }
-  }))
-  return { nodes: validated, replaced: replacements }
+  // No longer remove or replace invalid image URLs; always return original nodes unchanged
+  return { nodes, replaced: [] }
 }
 
 function styleEdge(e: WorkflowEdge): WorkflowEdge {
@@ -859,6 +875,26 @@ function styleEdge(e: WorkflowEdge): WorkflowEdge {
   const markerStart = arrow === 'start' || arrow === 'both' ? { type: MarkerType.ArrowClosed, color } : undefined
   const markerEnd = arrow === 'end' || arrow === 'both' ? { type: MarkerType.ArrowClosed, color } : undefined
   return { ...e, style: { ...(e.style || {}), stroke: color, strokeDasharray: dash }, markerStart, markerEnd }
+}
+
+// Clean up URLs that might be in markdown format [text](url) or just have extra formatting
+function cleanUrl(text: string): string {
+  if (!text) return text
+  
+  // Remove markdown link format: [text](url) -> url
+  const markdownMatch = text.match(/\[.*?\]\((https?:\/\/[^)]+)\)/)
+  if (markdownMatch) {
+    return markdownMatch[1]
+  }
+  
+  // Also handle just the URL part if someone pastes [url](url) format
+  const duplicateUrlMatch = text.match(/\[(https?:\/\/[^\]]+)\]\(\1\)/)
+  if (duplicateUrlMatch) {
+    return duplicateUrlMatch[1]
+  }
+  
+  // Remove extra whitespace and common wrapper characters
+  return text.trim().replace(/^[\[\("'`]+|[\]\)"'`]+$/g, '')
 }
 
 // Heuristic to detect if a pasted/dropped URL is likely an image.
@@ -974,7 +1010,12 @@ function EditModal({ initial, onSave, onClose }: { initial: { shape: NodeShape; 
 
         <label>
           Image URL (optional)
-          <input value={imageUrl} onChange={(e) => setImageUrl(e.target.value)} placeholder="https://..." />
+          <input 
+            value={imageUrl} 
+            onChange={(e) => setImageUrl(cleanUrl(e.target.value))} 
+            placeholder="https://..." 
+            onBlur={(e) => setImageUrl(cleanUrl(e.target.value))}
+          />
         </label>
 
         <label>
@@ -1053,7 +1094,7 @@ function PasteJsonModal({ initialText, error, onImport, onClose }: { initialText
 }
 
 function AiPromptModal({ onClose }: { onClose: () => void }) {
-  const prompt = `You are a workflow graph generator. Convert the user’s natural language description into a JSON object representing a directed flow of nodes and edges for a React Flow based editor.\n\nOUTPUT RULES (strict):\n- Output ONLY raw JSON (no markdown, commentary, fencing).\n- Do NOT wrap JSON in backticks.\n- Top-level object only: { "nodes": [...], "edges": [...] }.\n- Unique ids for every node & edge.\n- Each edge.source/edge.target must exist as a node id.\n- Prefer acyclic unless explicit loops described.\n- Property order: nodes[id, shape, position, data], edges[id, source, target, data].\n- No extra keys. No null; omit instead. Numbers finite.\n- EVERY node MUST include data.imageUrl pointing to a meaningful, stable, openly-licensed HTTPS image (public domain / CC0 / freely reusable).\n\nSHAPES: circle | square | rectangle | squareRightRound | rectRightRound\nORIENTATION: 0 | 90 | 180 | 270 (omit if 0).\nEDGE defaults: styleKind=\"solid\", arrow=\"end\" (omit if default).\n\nIMAGE URL POLICY (MANDATORY):\n- Use stable direct image URLs (PNG/JPG/SVG/WebP) hosted on reputable open-license sources (e.g., Wikimedia Commons raw file URLs or other public-domain repositories).\n- Do NOT reference well-known developer asset CDNs (avoid unpkg, jsdelivr, npm icon packs) or brand/logo icon libraries.\n- Do NOT output scraping instructions; only final direct image URLs.\n- Each URL must be HTTPS and point directly to the image file (file extension or stable media query).\n- No placeholders (no lorem/example/dummy services).\n- Avoid repeating the exact same imageUrl for different semantic roles unless justified.\n\nSemantic guidance examples (abstract conceptual imagery): ingest=data pipeline illustration; validate=shield or check; transform=geometric shift; decision=branching diagram; merge=converging arrows; deploy=rocket; metrics=dashboard graph; error=warning symbol; database=stacked disks; auth=lock; schedule=calendar; export=share symbol.\n\nLAYOUT: Left→Right. First node {x:0,y:0}. Increment x ≈230 per stage. Branch siblings share same x; vertical spacing ≈140. Keep coordinates integer ≥0. Center decision node above its branches. Merge only if user describes reconvergence.\n\nSHAPE GUIDANCE:\ncircle=external trigger/input; square=atomic task; rectangle=processing/aggregation; squareRightRound=decision/gateway; rectRightRound=integration/output/deployment.\n\nORIENTATION: use sparingly (≤25% nodes) for emphasis.\n\nID RULES: node_1..node_N dense; edge_1..edge_M dense.\n\nVALIDATION BEFORE OUTPUT:\n1. All edges reference existing nodes.\n2. Every node has data.imageUrl (HTTPS, direct image, open-license).\n3. At least one node.\n4. No duplicate ids.\n5. JSON parses (no comments/trailing commas).\n6. Coordinates numeric.\n7. No extraneous properties.\n\nUSER DESCRIPTION TO TRANSFORM:\n<<USER_WORKFLOW_DESCRIPTION>>\n\nDELIVERABLE: Return ONLY the JSON object.`
+  const prompt = `You are a workflow graph generator. Convert the user’s natural language description into a JSON object representing a directed flow of nodes and edges for a React Flow based editor.\n\nOUTPUT RULES (strict):\n- Output ONLY raw JSON (no markdown, commentary, fencing).\n- Do NOT wrap JSON in backticks.\n- Top-level object only: { "nodes": [...], "edges": [...] }.\n- Unique ids for every node & edge.\n- Each edge.source/edge.target must exist as a node id.\n- Prefer acyclic unless explicit loops described.\n- Property order: nodes[id, shape, position, data], edges[id, source, target, data].\n- No extra keys. No null; omit instead. Numbers finite.\n- EVERY node MUST include data.imageUrl pointing to a meaningful, stable, openly-licensed HTTPS image (public domain / CC0 / freely reusable).\n\nSHAPES: circle | square | rectangle | squareRightRound | rectRightRound\nORIENTATION: 0 | 90 | 180 | 270 (omit if 0).\nEDGE defaults: styleKind=\"solid\", arrow=\"end\" (omit if default).\n\nIMAGE URL POLICY (MANDATORY):\n- Use stable direct image URLs (PNG/JPG/SVG/WebP) hosted on reputable open-license sources.\n- CRITICAL: Output ONLY clean URLs - NO markdown formatting like [text](url).\n- Each URL must be HTTPS and point directly to the image file.\n- Examples of good URLs: https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Icon.png/64px-Icon.png\n- Do NOT use: [description](url) or any bracketed formats.\n- No placeholders (no lorem/example/dummy services).\n- Avoid repeating the exact same imageUrl for different semantic roles unless justified.\n\nNODE LABELING (MANDATORY):\n- Each node must have a clear, descriptive data.label (2-4 words max).\n- Labels should describe the ACTION or PURPOSE, not just generic terms.\n- Good examples: \"Validate Input\", \"Transform Data\", \"Send Email\", \"Check Status\".\n- Bad examples: \"Node 1\", \"Process\", \"Step\", \"Item\".\n- Use active verbs when possible: \"Parse\", \"Filter\", \"Generate\", \"Deploy\".\n- For decision nodes: \"Route by Type\", \"Check Condition\", \"Validate Rules\".\n- For input/output: \"Receive Data\", \"Export Results\", \"Load Config\".\n\nSEMANTIC GUIDANCE:\n- ingest/input: data pipeline, upload arrow, input funnel\n- validate/check: shield, checkmark, security badge  \n- transform/process: gears, conversion arrows, data transformation\n- decision/branch: diamond, fork in road, decision tree\n- merge/join: converging arrows, merge symbol\n- deploy/output: rocket launch, deployment, export\n- error/alert: warning triangle, error symbol, alert icon\n- database/store: database cylinders, storage, archive\n- api/service: cloud, network, api symbol\n- schedule/time: calendar, clock, timer\n\nLAYOUT: Left→Right. First node {x:0,y:0}. Increment x ≈230 per stage. Branch siblings share same x; vertical spacing ≈140. Keep coordinates integer ≥0. Center decision node above its branches. Merge only if user describes reconvergence.\n\nSHAPE GUIDANCE:\ncircle=external trigger/input; square=atomic task; rectangle=processing/aggregation; squareRightRound=decision/gateway; rectRightRound=integration/output/deployment.\n\nORIENTATION: use sparingly (≤25% nodes) for emphasis.\n\nID RULES: node_1..node_N dense; edge_1..edge_M dense.\n\nVALIDATION BEFORE OUTPUT:\n1. All edges reference existing nodes.\n2. Every node has data.imageUrl (HTTPS, direct image, open-license, NO markdown formatting).\n3. Every node has meaningful data.label (descriptive action/purpose).\n4. At least one node.\n5. No duplicate ids.\n6. JSON parses (no comments/trailing commas).\n7. Coordinates numeric.\n8. No extraneous properties.\n\nUSER DESCRIPTION TO TRANSFORM:\n<<USER_WORKFLOW_DESCRIPTION>>\n\nDELIVERABLE: Return ONLY the JSON object.`
   const [copied, setCopied] = useState(false)
   const copy = () => { navigator.clipboard.writeText(prompt).then(()=> { setCopied(true); setTimeout(()=> setCopied(false), 1600) }) }
   return (
